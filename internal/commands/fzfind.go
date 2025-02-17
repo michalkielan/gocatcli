@@ -12,9 +12,16 @@ import (
 	"gocatcli/internal/stringer"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/ktr0731/go-fuzzyfinder"
 	"github.com/spf13/cobra"
+)
+
+const (
+	initialChunkSize = 1000
+	fzFinderRefreshInterval = 150 * time.Millisecond
 )
 
 var (
@@ -80,24 +87,56 @@ func fzFind(_ *cobra.Command, args []string) error {
 			startNodes = append(startNodes, top)
 		}
 	}
+	bufferedEntryCh := make(chan *fzfEntry, initialChunkSize)
+	go func() {
+		for _, foundNode := range startNodes {
+			fzFindFillList(foundNode, bufferedEntryCh)
+		}
+	}()
 
 	// list of entries
 	var entries []*fzfEntry
+	var entriesMutex sync.RWMutex
 	log.Debugf("start nodes: %v", startNodes)
-	for _, foundNode := range startNodes {
-		entries = append(entries, fzFindFillList(foundNode)...)
+	for i := 0; i < initialChunkSize; i++ {
+		entry, ok := <-bufferedEntryCh
+		if !ok {
+			break
+		}
+		entries = append(entries, entry)
 	}
 
-	log.Debugf("options contain %d entries", len(entries))
+	loadMoreEntries := func() {
+		for {
+			select {
+			case entry, ok := <-bufferedEntryCh:
+				if !ok {
+					log.Debugf("Channel closed, no more entries")
+					return
+				}
+				entries = append(entries, entry)
+			default:
+				return
+			}
+		}
+	}
 
 	getItemFunc := func(i int) string {
-		return entries[i].Path
+		if i >= len(entries) {
+			loadMoreEntries()
+		}
+		if i < len(entries) {
+			return entries[i].Path
+		}
+		return ""
 	}
 
 	previewFunc := func(i, _, _ int) string {
-		if i == -1 {
+		if i == -1 || i >= len(entries) {
 			return ""
 		}
+		entriesMutex.RLock()
+		defer entriesMutex.RUnlock()
 		entry := entries[i]
 		var outs []string
 		outs = append(outs, fmt.Sprintf("storage: %s", entry.storage.Name))
@@ -110,17 +149,27 @@ func fzFind(_ *cobra.Command, args []string) error {
 	}
 
 	// display fzf finder interface
+	entriesLoadRefreshTicker := time.NewTicker(fzFinderRefreshInterval)
+	defer entriesLoadRefreshTicker.Stop()
+
+	go func() {
+		for range entriesLoadRefreshTicker.C {
+			loadMoreEntries()
+		}
+	}()
+
 	idx, err := fuzzyfinder.Find(
-		entries,
+		&entries,
 		getItemFunc,
 		fuzzyfinder.WithPreviewWindow(previewFunc),
+		fuzzyfinder.WithHotReloadLock(&entriesMutex),
 	)
 	if err != nil {
 		return err
 	}
 
 	// print result
-	if idx > -1 && idx < len(entries) {
+	if idx >= 0 && idx < len(entries) {
 		// list parent directory
 		entry := entries[idx]
 		log.Debugf("selected entry: %s", entry.Path)
@@ -149,8 +198,7 @@ func fzFind(_ *cobra.Command, args []string) error {
 	return nil
 }
 
-func fzFindFillList(n node.Node) []*fzfEntry {
-	var list []*fzfEntry
+func fzFindFillList(n node.Node, entryCh chan<- *fzfEntry) {
 	top := loadedTree.GetStorageNode(n)
 	callback := func(n node.Node, _ int, _ node.Node) bool {
 		item := &fzfEntry{
@@ -158,9 +206,9 @@ func fzFindFillList(n node.Node) []*fzfEntry {
 			item:    n,
 			storage: top,
 		}
-		list = append(list, item)
+		entryCh <- item
 		return true
 	}
 	loadedTree.ProcessChildren(n, fzFindOptShowAll, callback, -1)
-	return list
+	close(entryCh)
 }
